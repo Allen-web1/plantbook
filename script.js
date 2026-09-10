@@ -41,6 +41,59 @@ async function callPlantGuideApi(
   return await response.json();
 }
 
+// 서버가 일시적으로 혼잡할 때 저장 요청 자동 재시도
+async function callPlantGuideApiWithRetry(
+  action,
+  requestData = {},
+  maxAttempts = 4
+) {
+  let lastResult = null;
+  let lastError = null;
+
+  for (
+    let attempt = 1;
+    attempt <= maxAttempts;
+    attempt += 1
+  ) {
+    try {
+      const result =
+        await callPlantGuideApi(
+          action,
+          requestData
+        );
+
+      if (
+        result.success ||
+        !result.retryable
+      ) {
+        return result;
+      }
+
+      lastResult = result;
+    } catch (error) {
+      lastError = error;
+    }
+
+    if (attempt < maxAttempts) {
+      const delay =
+        700 * Math.pow(2, attempt - 1) +
+        Math.floor(Math.random() * 700);
+
+      await new Promise(function (resolve) {
+        window.setTimeout(resolve, delay);
+      });
+    }
+  }
+
+  if (lastResult) {
+    return lastResult;
+  }
+
+  throw lastError || new Error(
+    "서버 요청에 실패했습니다."
+  );
+}
+
 // 화면
 const welcomeSection =
   document.getElementById("welcomeSection");
@@ -129,6 +182,10 @@ const loggedInStudentNumber =
 let currentStudent = null;
 
 const savedPhotoMap = new Map();
+
+// 학생별 브라우저 임시저장 상태
+let plantDraftSaveTimer = null;
+let plantFormHasUnsavedChanges = false;
 
 // 시작하기
 startButton.addEventListener("click", function () {
@@ -460,6 +517,9 @@ logoutButton.addEventListener(
     const tokenToDelete =
       currentStudentToken;
 
+    // 로그아웃 직전까지 입력한 내용도 보존
+    saveLocalPlantDraft();
+
     try {
       if (tokenToDelete) {
         await callPlantGuideApi(
@@ -485,6 +545,7 @@ logoutButton.addEventListener(
     sharedPlants = [];
 
     plantRecordForm.reset();
+    plantFormHasUnsavedChanges = false;
     loginForm.reset();
 
     loggedInStudentName.textContent = "";
@@ -542,6 +603,7 @@ cancelPlantButton.addEventListener(
     }
 
     plantRecordForm.reset();
+    clearLocalPlantDraft();
     showOnlySection(studentMenuSection);
     window.scrollTo(0, 0);
   }
@@ -846,12 +908,18 @@ function createSpeciesForms() {
 
   plantRecordForm.addEventListener(
     "input",
-    updateSpeciesProgress
+    function () {
+      updateSpeciesProgress();
+      markPlantFormAsChanged();
+    }
   );
 
   plantRecordForm.addEventListener(
     "change",
-    updateSpeciesProgress
+    function () {
+      updateSpeciesProgress();
+      markPlantFormAsChanged();
+    }
   );
 }
 
@@ -1294,39 +1362,33 @@ plantRecordForm.addEventListener(
 
     hideMessage(plantFormMessage);
 
+    const submissionRequest = {
+      sessionToken:
+        currentStudentToken,
+
+      references:
+        referencesInput.value.trim(),
+
+      reflection:
+        reflectionInput.value.trim(),
+
+      plants:
+        plants
+    };
+
+    let textSaved = false;
+
     try {
-    const selectedPhotoCount =
-      countSelectedPhotos();
+      // 사진보다 작성 내용을 먼저 저장하여
+      // 업로드 중 연결이 끊겨도 글이 사라지지 않게 함
+      submitPlantButton.textContent =
+        "식물 기록 저장 중...";
 
-      if (selectedPhotoCount > 0) {
-        await uploadSelectedPlantPhotos(
-          function (current, total) {
-            submitPlantButton.textContent =
-              `사진 업로드 중 ${current} / ${total}`;
-      }
-    );
-  }
-
-  submitPlantButton.textContent =
-    "식물 기록 저장 중...";
-
-  const result =
-    await callPlantGuideApi(
-      "saveSubmission",
-      {
-        sessionToken:
-          currentStudentToken,
-
-        references:
-          referencesInput.value.trim(),
-
-        reflection:
-          reflectionInput.value.trim(),
-
-        plants:
-          plants
-      }
-    );
+      const result =
+        await callPlantGuideApiWithRetry(
+          "saveSubmission",
+          submissionRequest
+        );
 
       if (!result.success) {
         showMessage(
@@ -1339,10 +1401,42 @@ plantRecordForm.addEventListener(
         return;
       }
 
+      textSaved = true;
+
       temporaryLastSavedAt =
         result.savedAt
           ? new Date(result.savedAt)
           : new Date();
+
+      plantFormHasUnsavedChanges = false;
+      clearLocalPlantDraft();
+
+      const selectedPhotoCount =
+        countSelectedPhotos();
+
+      if (selectedPhotoCount > 0) {
+        await uploadSelectedPlantPhotos(
+          function (current, total) {
+            submitPlantButton.textContent =
+              `사진 업로드 중 ${current} / ${total}`;
+          }
+        );
+
+        // 사진 수가 교사 화면에 즉시 반영되도록
+        // 사진 완료 후 제출 현황만 한 번 더 갱신
+        const finalResult =
+          await callPlantGuideApiWithRetry(
+            "saveSubmission",
+            submissionRequest
+          );
+
+        if (finalResult.success) {
+          temporaryLastSavedAt =
+            finalResult.savedAt
+              ? new Date(finalResult.savedAt)
+              : new Date();
+        }
+      }
 
       showMessage(
         plantFormMessage,
@@ -1358,11 +1452,23 @@ plantRecordForm.addEventListener(
     } catch (error) {
       console.error(error);
 
-      showMessage(
-        plantFormMessage,
-        "서버에 연결하지 못했습니다. 인터넷 연결과 배포 상태를 확인해주세요.",
-        "error"
-      );
+      if (textSaved) {
+        showMessage(
+          plantFormMessage,
+          "작성 내용은 저장되었습니다. 일부 사진은 저장되지 않았을 수 있으니 확인 후 다시 제출해주세요.",
+          "error"
+        );
+
+        window.alert(
+          "작성한 글은 안전하게 저장되었습니다. 사진 업로드가 완료되지 않았으므로 잠시 후 다시 제출해주세요."
+        );
+      } else {
+        showMessage(
+          plantFormMessage,
+          "서버가 혼잡하거나 연결이 불안정합니다. 작성 내용은 이 기기에 임시 저장되었습니다. 잠시 후 다시 제출해주세요.",
+          "error"
+        );
+      }
     } finally {
       submitPlantButton.disabled = false;
       submitPlantButton.textContent =
@@ -2685,6 +2791,233 @@ window.addEventListener(
   }
 );
 
+// 현재 로그인 학생의 브라우저 임시저장 키
+function getLocalPlantDraftKey() {
+  if (
+    !currentStudent ||
+    !currentStudent.studentNumber
+  ) {
+    return null;
+  }
+
+  return (
+    "plantGuideDraft_" +
+    String(currentStudent.studentNumber)
+  );
+}
+
+// 입력 내용이 바뀌면 잠시 후 자동 임시저장
+function markPlantFormAsChanged() {
+  if (!currentStudent) {
+    return;
+  }
+
+  plantFormHasUnsavedChanges = true;
+
+  if (plantDraftSaveTimer) {
+    window.clearTimeout(
+      plantDraftSaveTimer
+    );
+  }
+
+  plantDraftSaveTimer =
+    window.setTimeout(
+      saveLocalPlantDraft,
+      500
+    );
+}
+
+// 사진을 제외한 작성 내용을 브라우저에 임시저장
+function saveLocalPlantDraft() {
+  if (plantDraftSaveTimer) {
+    window.clearTimeout(
+      plantDraftSaveTimer
+    );
+    plantDraftSaveTimer = null;
+  }
+
+  if (!plantFormHasUnsavedChanges) {
+    return;
+  }
+
+  const draftKey =
+    getLocalPlantDraftKey();
+
+  if (!draftKey) {
+    return;
+  }
+
+  const values = {};
+
+  plantRecordForm
+    .querySelectorAll(
+      "input:not([type='file']), textarea, select"
+    )
+    .forEach(function (element) {
+      const key =
+        element.name || element.id;
+
+      if (!key) {
+        return;
+      }
+
+      if (
+        element.type === "checkbox" ||
+        element.type === "radio"
+      ) {
+        values[key] = element.checked;
+      } else {
+        values[key] = element.value;
+      }
+    });
+
+  try {
+    window.localStorage.setItem(
+      draftKey,
+      JSON.stringify({
+        savedAt: Date.now(),
+        values: values
+      })
+    );
+  } catch (error) {
+    console.error(
+      "작성 내용 임시저장 실패:",
+      error
+    );
+  }
+}
+
+// 서버 기록보다 새로운 브라우저 초안이 있으면 복구
+function restoreLocalPlantDraft(
+  serverUpdatedAt
+) {
+  const draftKey =
+    getLocalPlantDraftKey();
+
+  if (!draftKey) {
+    return false;
+  }
+
+  try {
+    const savedDraft =
+      window.localStorage.getItem(
+        draftKey
+      );
+
+    if (!savedDraft) {
+      return false;
+    }
+
+    const draft =
+      JSON.parse(savedDraft);
+
+    const draftSavedAt =
+      Number(draft.savedAt || 0);
+
+    const parsedServerSavedAt =
+      serverUpdatedAt
+        ? Date.parse(serverUpdatedAt)
+        : 0;
+
+    const serverSavedAt =
+      Number.isFinite(parsedServerSavedAt)
+        ? parsedServerSavedAt
+        : 0;
+
+    if (
+      serverSavedAt > 0 &&
+      draftSavedAt <= serverSavedAt
+    ) {
+      window.localStorage.removeItem(
+        draftKey
+      );
+      plantFormHasUnsavedChanges = false;
+      return false;
+    }
+
+    const values = draft.values || {};
+
+    Object.keys(values).forEach(
+      function (key) {
+        const element =
+          plantRecordForm.elements[key] ||
+          document.getElementById(key);
+
+        if (!element) {
+          return;
+        }
+
+        if (
+          element.type === "checkbox" ||
+          element.type === "radio"
+        ) {
+          element.checked =
+            Boolean(values[key]);
+        } else if (
+          element.type !== "file"
+        ) {
+          element.value =
+            values[key] == null
+              ? ""
+              : String(values[key]);
+        }
+      }
+    );
+
+    plantFormHasUnsavedChanges = true;
+    return true;
+  } catch (error) {
+    console.error(
+      "작성 내용 임시저장 복구 실패:",
+      error
+    );
+    return false;
+  }
+}
+
+// 현재 학생의 브라우저 임시 초안 제거
+function clearLocalPlantDraft() {
+  if (plantDraftSaveTimer) {
+    window.clearTimeout(
+      plantDraftSaveTimer
+    );
+    plantDraftSaveTimer = null;
+  }
+
+  const draftKey =
+    getLocalPlantDraftKey();
+
+  if (!draftKey) {
+    return;
+  }
+
+  try {
+    window.localStorage.removeItem(
+      draftKey
+    );
+  } catch (error) {
+    console.error(
+      "작성 내용 임시저장 삭제 실패:",
+      error
+    );
+  }
+}
+
+// 화면 전환·종료 직전까지 입력한 내용 보존
+document.addEventListener(
+  "visibilitychange",
+  function () {
+    if (document.hidden) {
+      saveLocalPlantDraft();
+    }
+  }
+);
+
+window.addEventListener(
+  "pagehide",
+  saveLocalPlantDraft
+);
+
 // Google Sheets에서 나의 저장 기록 불러오기
 async function loadMySubmissionFromServer() {
   if (
@@ -2717,8 +3050,10 @@ async function loadMySubmissionFromServer() {
     
     savedPhotoMap.clear();
     temporaryLastSavedAt = null;
+    plantFormHasUnsavedChanges = false;
 
     if (!result.hasSubmission) {
+      restoreLocalPlantDraft(null);
       updateSpeciesProgress();
       return true;
     }
@@ -2819,6 +3154,10 @@ async function loadMySubmissionFromServer() {
           result.submission.updatedAt
         );
     }
+
+    restoreLocalPlantDraft(
+      result.submission.updatedAt
+    );
 
     updateSpeciesProgress();
 
@@ -2944,7 +3283,7 @@ async function uploadSelectedPlantPhotos(
       );
 
     const result =
-      await callPlantGuideApi(
+      await callPlantGuideApiWithRetry(
         "uploadPhoto",
         {
           sessionToken:
